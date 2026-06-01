@@ -1,0 +1,14 @@
+include:
+  - project: 'devops/ci-template'
+    ref: master
+    file: '.gitlab-ci.yml'
+
+variables:
+  OC_IMAGE_NAME: sample-microservice
+  PROJECTNAME: sample-microservice
+
+stages:
+  - build
+  - deploy_prod
+  - sonarqube
+  - metrics

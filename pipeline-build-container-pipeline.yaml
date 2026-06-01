@@ -1,0 +1,123 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  generation: 1
+  managedFields:
+    - apiVersion: tekton.dev/v1
+      fieldsType: FieldsV1
+      fieldsV1:
+        'f:spec':
+          .: {}
+          'f:params': {}
+          'f:tasks': {}
+          'f:workspaces': {}
+      manager: Mozilla
+      operation: Update
+  name: build-container-pipeline
+  namespace: devplatform-test
+spec:
+  params:
+    - description: Represents the fully qualified image name in the internal OpenShift Container Registry where the image will be built.
+      name: IMAGE
+      type: string
+    - description: The HTTP(S) URL of the Git repository from which the source code is fetched
+      name: SOURCE_URL
+      type: string
+    - description: The git branch where the Dockerfile is located
+      name: SOURCE_REVISION
+      type: string
+    - description: 'Dockerfile build arguments, array of key=value'
+      name: BUILD_ARGS
+      type: string
+    - description: 'Extra parameters passed for the Buildah build command when building images. '
+      name: BUILD_EXTRA_ARGS
+      type: string
+  tasks:
+    - name: buildah
+      params:
+        - name: IMAGE
+          value: $(params.IMAGE)
+        - name: DOCKERFILE
+          value: ./Dockerfile
+        - name: BUILD_ARGS
+          value:
+            - '$(params.BUILD_ARGS[*])'
+        - name: CONTEXT
+          value: /workspace/source/
+        - name: STORAGE_DRIVER
+          value: vfs
+        - name: FORMAT
+          value: oci
+        - name: BUILD_EXTRA_ARGS
+          value: $(params.BUILD_EXTRA_ARGS)
+        - name: PUSH_EXTRA_ARGS
+          value: ''
+        - name: SKIP_PUSH
+          value: 'false'
+        - name: TLS_VERIFY
+          value: 'true'
+        - name: VERBOSE
+          value: 'false'
+      runAfter:
+        - git-clone
+      taskRef:
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: buildah
+          - name: namespace
+            value: openshift-pipelines
+        resolver: cluster
+      workspaces:
+        - name: source
+          workspace: build-container-workspace
+    - name: git-clone
+      params:
+        - name: CRT_FILENAME
+          value: ca-bundle.crt
+        - name: HTTP_PROXY
+          value: ''
+        - name: HTTPS_PROXY
+          value: ''
+        - name: NO_PROXY
+          value: ''
+        - name: SUBDIRECTORY
+          value: ''
+        - name: USER_HOME
+          value: /home/git
+        - name: DELETE_EXISTING
+          value: 'true'
+        - name: VERBOSE
+          value: 'false'
+        - name: SSL_VERIFY
+          value: 'true'
+        - name: URL
+          value: $(params.SOURCE_URL)
+        - name: REVISION
+          value: $(params.SOURCE_REVISION)
+        - name: REFSPEC
+          value: ''
+        - name: SUBMODULES
+          value: 'true'
+        - name: DEPTH
+          value: '1'
+        - name: SPARSE_CHECKOUT_DIRECTORIES
+          value: ''
+      taskRef:
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: openshift-pipelines
+        resolver: cluster
+      workspaces:
+        - name: output
+          workspace: build-container-workspace
+        - name: basic-auth
+          workspace: basic-auth
+  workspaces:
+    - name: build-container-workspace
+    - name: basic-auth

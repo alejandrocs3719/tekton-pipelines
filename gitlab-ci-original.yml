@@ -1,0 +1,648 @@
+variables:
+  OC_IMAGE_NAME: default-project
+  VERSION: $CI_COMMIT_SHORT_SHA.$CI_PIPELINE_IID
+  DESTINATION: --no-push
+  PROJECTNAME: default-project
+  PROJECTSOURCE: .
+  HTTP_PROXY: $CODE_PROXY
+  HTTPS_PROXY: $CODE_PROXY
+  NO_PROXY: $CODE_NO_PROXY,$OC_REGISTRY_URL,$OC_REGISTRY_URL_TEST,$OC_REGISTRY_URL_PROD
+  UICONFIG: ""
+  UI_FRAMEWORK_LICENSE: $UI_FRAMEWORK_LICENSE
+  NPM_PACKAGE_REGISTRY_TOKEN: $NPM_PACKAGE_REGISTRY_TOKEN
+  SONAR_DOTNET_SCANNER: ""
+  
+stages:
+  - build
+  - deploy_prod
+  - sonarqube
+  - metrics
+
+
+
+build:
+  stage: build  
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - VERSION=$(date +'%Y%m%d').$VERSION
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "dev"
+      variables:
+        REGISTRY_PASSWORD: $OC_REGISTRY_PASSWORD_TEST
+        REGISTRY_URL: $OC_REGISTRY_URL_TEST
+        DESTINATION: --destination $REGISTRY_URL/$OC_REGISTRY_PROJECT-test/$OC_IMAGE_NAME:$VERSION --destination $REGISTRY_URL/$OC_REGISTRY_PROJECT-test/$OC_IMAGE_NAME:latest
+    - if: $CI_COMMIT_REF_NAME == "master"
+      variables:
+        UICONFIG: staging
+        REGISTRY_PASSWORD: $OC_REGISTRY_PASSWORD_STG
+        REGISTRY_URL: $OC_REGISTRY_URL_STG
+        DESTINATION: --destination $REGISTRY_URL/$OC_REGISTRY_PROJECT-staging/$OC_IMAGE_NAME:$VERSION --destination $REGISTRY_URL/$OC_REGISTRY_PROJECT-staging/$OC_IMAGE_NAME:staging
+  script:
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export no_proxy=$NO_PROXY
+    - echo $VERSION
+    - echo "{\"auths\":{\"$REGISTRY_URL\":{\"username\":\"$OC_REGISTRY_USER \",\"password\":\"$REGISTRY_PASSWORD \"}}}" > /kaniko/.docker/config.json
+    - echo "$CA_CERTIFICATES_BUNDLE" >> /kaniko/ssl/certs/ca-certificates.crt
+    - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile --build-arg APP_VERSION=$VERSION --build-arg CONFIG="$UICONFIG" --build-arg NUGET_CONFIG="$NUGET_CONFIG" --build-arg BUILD_PATH=$PROJECTNAME $DESTINATION --build-arg no_proxy=$no_proxy --build-arg http_proxy=$http_proxy --build-arg https_proxy=$https_proxy --build-arg UI_FRAMEWORK_LICENSE=$UI_FRAMEWORK_LICENSE --build-arg CI_SERVER_HOST=$CI_SERVER_HOST --build-arg NPM_PACKAGE_REGISTRY_TOKEN=$NPM_PACKAGE_REGISTRY_TOKEN 2>&1 | tee full_output.log
+    - echo $VERSION > version.txt 
+    
+  artifacts:
+    paths:
+      - full_output.log       
+      - version.txt
+    expire_in: 1 day 
+  allow_failure: false
+  retry: 
+    max: 2
+    when:
+      - script_failure
+  tags:
+    - DOCKER
+
+deploy_prod:
+  stage: deploy_prod
+  image:
+    name: quay.io/skopeo/stable:latest
+    entrypoint: [""]
+  when: manual
+  only:
+    - master
+  variables:
+    USERS: $ALLOWED_USERS,$OWNERS
+    UICONFIG: production
+    STAGING_IMAGE_TAG: $OC_REGISTRY_URL_STG/$OC_REGISTRY_PROJECT-staging/$OC_IMAGE_NAME:$CI_COMMIT_SHORT_SHA.$CI_PIPELINE_IID
+    PROD_IMAGE_PREFIX: $OC_REGISTRY_URL_PROD/$OC_REGISTRY_PROJECT/$OC_IMAGE_NAME
+  before_script:
+    - VERSION=$(date +'%Y%m%d').$VERSION
+  script:
+    - |
+      if [[ "$USERS" != *$GITLAB_USER_EMAIL* ]]; then
+        echo "ERROR: user not found in allowed_users list. "
+        exit 1
+      fi
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export no_proxy=$NO_PROXY
+    - echo "$CA_CERTIFICATES_BUNDLE" >> /etc/ssl/certs/ca-certificates.crt
+    - skopeo copy --src-creds $OC_REGISTRY_USER:$OC_REGISTRY_PASSWORD_STG  --dest-creds $OC_REGISTRY_USER_PROD:$OC_REGISTRY_PASSWORD_PROD  docker://$STAGING_IMAGE_TAG docker://$PROD_IMAGE_PREFIX:$VERSION
+    - skopeo copy --src-creds $OC_REGISTRY_USER_PROD:$OC_REGISTRY_PASSWORD_PROD  --dest-creds $OC_REGISTRY_USER_PROD:$OC_REGISTRY_PASSWORD_PROD  docker://$PROD_IMAGE_PREFIX:$VERSION docker://$PROD_IMAGE_PREFIX:prod
+  tags:
+    - DOCKER
+
+
+
+
+sonarqube:
+  stage: sonarqube
+  image:
+     name: sonarsource/sonar-scanner-cli:latest
+     entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  rules:
+    - exists:
+      - '*.sln'
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "dev"
+      when: always
+      variables: 
+        SONAR_DOTNET_SCANNER: false
+  before_script:
+    - echo $SONAR_DOTNET_SCANNER
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export no_proxy=$NO_PROXY
+    - mkdir -p $SONAR_USER_HOME/ssl
+    - keytool -import -storetype PKCS12 -alias sonar -keystore "$SONAR_USER_HOME/ssl/truststore.p12" -file "$SONAR_CERT_BUNDLE" -storepass "$SONAR_TRUSTSTORE_PASSWORD" -noprompt
+    - sonar-scanner -Dsonar.host.url="$SONAR_HOST_URL" -Dsonar.token="$SONAR_TOKEN" -Dsonar.projectKey="$PROJECTNAME" -Dsonar.projectName="$CI_PROJECT_TITLE" -Dsonar.sources="$PROJECTSOURCE" -Dsonar.scanner.truststorePassword="$SONAR_TRUSTSTORE_PASSWORD"
+  allow_failure: true
+  tags:
+    - DOCKER
+
+
+
+
+sonarqube-dotnet:
+  stage: sonarqube
+  image: registry.corpname.com/devops/infra-tools:sonarqube-dotnet
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "dev"
+      exists:
+      - '*.sln'
+      variables:
+        SONAR_DOTNET_SCANNER: true
+    - when: never
+  before_script:
+    - echo $SONAR_DOTNET_SCANNER
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export NO_PROXY=\"$NO_PROXY,secportal.corpname.com\"
+    - export no_proxy=$NO_PROXY
+    - export http_proxy_bak=$HTTP_PROXY
+    - export https_proxy_bak=$HTTPS_PROXY
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - unset VERSION
+    - echo $NUGET_CONFIG > ~/.nuget/NuGet/NuGet.Config
+    - apt-get update
+    - apt-get install --yes openjdk-17-jre
+    - apt-get install --yes nodejs
+    - dotnet tool install --global dotnet-sonarscanner
+    - mkdir -p $SONAR_USER_HOME/ssl
+    - keytool -import -storetype PKCS12 -alias sonar -keystore "$SONAR_USER_HOME/ssl/truststore.p12" -file "$SONAR_CERT_BUNDLE" -storepass "$SONAR_TRUSTSTORE_PASSWORD" -noprompt
+    - export PATH=\"$PATH:$HOME/.dotnet/tools\"
+    - unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
+    - dotnet sonarscanner begin /k:"$PROJECTNAME" /n:"$CI_PROJECT_TITLE" /d:sonar.login="$SONAR_TOKEN" /d:sonar.host.url="$SONAR_HOST_URL" /d:sonar.scanner.truststorePath="$SONAR_USER_HOME/ssl/truststore.p12" /d:sonar.scanner.truststorePassword="$SONAR_TRUSTSTORE_PASSWORD"
+    - export HTTP_PROXY=$http_proxy_bak http_proxy=$http_proxy_bak HTTPS_PROXY=$https_proxy_bak https_proxy=$https_proxy_bak
+    - dotnet build
+    - unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
+    - dotnet sonarscanner end /d:sonar.login=$SONAR_TOKEN /d:sonar.scanner.truststorePassword="$SONAR_TRUSTSTORE_PASSWORD"
+  allow_failure: true
+  tags:
+    - DOCKER
+
+
+
+publish-metrics:
+  stage: metrics
+  image: alpine:latest
+  dependencies:
+    - build
+  rules: 
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"      
+      when: never
+    - when: on_success
+  before_script:
+    - |
+      if [ ! -f version.txt ] || [ ! -f full_output.log ]; then
+        echo "Artifacts from build were not generated. Exiting job"
+        exit 0
+      fi
+  script:
+    - apk add --no-cache curl jq ca-certificates
+    - |
+      echo "$CA_CERTIFICATES_BUNDLE" > /etc/ssl/certs/corporate-ca.pem
+      update-ca-certificates
+
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export no_proxy=$NO_PROXY
+    - export HTTP_PROXY=$HTTP_PROXY
+    - export HTTPS_PROXY=$HTTPS_PROXY
+    - export NO_PROXY=$NO_PROXY
+    - export no_proxy="$NO_PROXY,.corpname.com,secportal-test.corpname.com"
+    - export NO_PROXY="$NO_PROXY,.corpname.com,secportal-test.corpname.com"
+
+    - VERSION=$(cat version.txt)
+    - awk 'BEGIN {IGNORECASE=1; first=1} /(\x1b\[[0-9;]*m)?(\[error\]|\[warning\]|▲ \[(WARNING|ERROR)\]|npm warn |npm ERR!|warning CS[0-9]{4}|\.cs\([0-9]+,[0-9]+\):\ warning)/ {gsub(/\x1b\[[0-9;]*m/, ""); if (!first) print ""; first=0; flag=1; print; next} flag {if ($0 ~ /^[[:space:]]|(\x1b\[[0-9;]*m)?(▲|npm|warning)|\.cs\([0-9]+,[0-9]+\):\ warning|^$/) {gsub(/\x1b\[[0-9;]*m/, ""); print} else {flag=0}}' full_output.log > stderr.log
+    - |
+      if grep -qi "\.cs(.*): warning\|\.csproj\]" stderr.log; then
+        awk 'BEGIN { IGNORECASE = 1; block_count = 0 } /INFO\[|TRACE|NODE_OPTIONS/ { next } /): warning|^npm warn |^▲ \[WARNING\]|^[[:space:]]*warning/ { if (block_count > 0) print ""; block_count++; flag=1; print } flag { if ($0 ~ /^[[:space:]]/ || $0 ~ /^[│╵\^~]|^$/) print; else flag=0 } END { print block_count > "warnings_count.txt" }' stderr.log > warnings_only.log
+      else
+        awk 'BEGIN { IGNORECASE = 1; block_count = 0 } /INFO\[|TRACE|NODE_OPTIONS/ { next } /^npm warn |^▲ \[WARNING\]|^[[:space:]]*warning[:]/ { if (block_count > 0) print ""; block_count++; flag=1; print } flag { if ($0 ~ /^[[:space:]]/ || $0 ~ /^[│╵\^~]|^$/) print; else flag=0 } END { print block_count > "warnings_count.txt" }' stderr.log > warnings_only.log
+      fi
+
+    - |  
+      VAR_ERRORS=$(grep -Eic "(error|ERROR)[: !]|npm ERR" stderr.log 2>/dev/null || echo 0)
+      VAR_ERRORS=$(echo $VAR_ERRORS | awk '{print $1+0}')
+
+    - |
+      VAR_WARNINGS=$(cat warnings_count.txt 2>/dev/null || echo 0)
+      VAR_WARNINGS=$(echo $VAR_WARNINGS | awk '{print $1+0}')
+
+
+    - |
+      echo "{\"Projects\": [{\"Name\": \"$CI_PROJECT_TITLE\", \"BuildWarnings\": $VAR_WARNINGS, \"BuildErrors\": $VAR_ERRORS, \"BuildCriticals\": 0, \"BuildErrorMessage\": null, \"DeployVersion\": \"$VERSION\"}]}" > final_report.json
+      cat final_report.json
+
+    - |
+      if [ -z "${API_CLIENT_ID}" ]; then echo "ERROR: API_CLIENT_ID is empty"; exit 1; fi
+
+      RESPONSE=$(curl --silent --location \
+        --cacert /etc/ssl/certs/corporate-ca.pem \
+        --request POST "https://secportal-test.corpname.com/id/connect/token" \
+        --header "Content-Type: application/x-www-form-urlencoded" \
+        -u "${API_CLIENT_ID}:${API_CLIENT_SECRET}" \
+        --data-urlencode "grant_type=client_credentials" \
+        --data-urlencode "scope=DevPlatform.Services.BuildMon")
+    
+      ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
+
+      if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+        exit 1
+      fi
+
+    - |
+      RESULT=$(curl --silent --location --cacert /etc/ssl/certs/corporate-ca.pem --request POST "https://secportal-test.corpname.com/buildmon-api/api/DataUpdate/update-metrics" \
+        --header "Authorization: Bearer $ACCESS_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data @"final_report.json")
+
+      echo "$RESULT"
+
+  allow_failure: true
+  tags:
+    - DOCKER
+
+
+
+
+docs_dotnet:
+  stage: metrics
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  dependencies:
+    - build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"      
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "dev"
+      exists:
+        - '**/*.csproj'
+    - if: $CI_COMMIT_REF_NAME == "master"
+      exists:
+        - '**/*.csproj'
+  before_script:
+    - |
+      if [ ! -f version.txt ]; then
+        echo "Artifacts from build were not generated. Exiting job"
+        exit 0
+      fi
+  script:
+    - export REPO_DOCS_USER="$REPO_DOCS_USER"
+    - export REPO_DOCS_TOKEN="$REPO_DOCS_TOKEN"
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export no_proxy=$NO_PROX
+    - export REPO_DOCS_PROJECT_ID="$REPO_DOCS_PROJECT_ID"
+    - DOCS_OUTPUT_DIR="docs"
+    - mkdir -p "$DOCS_OUTPUT_DIR"
+
+    - mkdir -p ~/.nuget/NuGet
+    - echo "$NUGET_CONFIG" > ~/.nuget/NuGet/NuGet.Config
+
+    - RAW_VERSION="${CI_COMMIT_TAG:-${CI_COMMIT_REF_SLUG:-${CI_PIPELINE_IID:-local}}}"
+
+    - |
+      normalize_version() {
+        local v="$1"
+        if printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+          printf '%s\n' "$v"
+        else
+          printf '1.0.0-ci.%s\n' "$(printf '%s' "$v" | tr -c '0-9A-Za-z.-' '-')"
+        fi
+      }
+
+    - SAFE_VERSION=$(normalize_version "$RAW_VERSION")
+
+    - |
+      find . -type f -name "*.csproj"  ! -path "*/bin/*" ! -path "*/obj/*" -print0 | while IFS= read -r -d $'\0' csproj_file; do
+        if [ ! -s "$csproj_file" ]; then
+          echo "File $csproj_file is empty. Skipping..."
+          continue
+        fi
+
+        if ! grep -q "<PropertyGroup>" "$csproj_file"; then
+          if grep -q "<Import " "$csproj_file"; then
+            sed -i '/<Import/a\
+      \t<PropertyGroup>\
+      \t\t<GenerateDocumentationFile>true</GenerateDocumentationFile>\
+      \t\t<DocumentationFile>Reference.xml</DocumentationFile>\
+      \t</PropertyGroup>' "$csproj_file"
+          else
+            echo "Error: <Import> not found in $csproj_file. Cannot insert configuration."
+            exit 1
+          fi
+        else
+          if ! grep -q "<GenerateDocumentationFile>" "$csproj_file"; then
+            sed -i '/<PropertyGroup>/a\
+      \t\t<GenerateDocumentationFile>true</GenerateDocumentationFile>' "$csproj_file"
+          fi
+
+          if ! grep -q "<DocumentationFile>" "$csproj_file"; then
+            sed -i '/<PropertyGroup>/a\
+      \t\t<DocumentationFile>Reference.xml</DocumentationFile>' "$csproj_file"
+          fi
+        fi
+
+        project_dir=$(dirname "$csproj_file")
+        dotnet restore "$csproj_file" -p:Version="$SAFE_VERSION"
+        dotnet build "$csproj_file" -c Release -p:Version="$SAFE_VERSION" --nowarn:CA2201,CA1307,CS1591
+
+        GENERATED_XML_PATH=$(find "$project_dir/bin/Release" -type f -name "Reference.xml" | head -n 1)
+        if [ -f "$GENERATED_XML_PATH" ]; then
+          cp "$GENERATED_XML_PATH" "$DOCS_OUTPUT_DIR/$(basename "$project_dir")-Reference.xml"
+        else
+          echo "Warning: XML file $GENERATED_XML_PATH not found for $csproj_file. Skipping..."
+        fi
+      done
+
+    - VERSION=$(cat version.txt)
+    - REPO_DOCS_BRANCH=master
+    - DEST_DIR="dotnet_docs/${CI_PROJECT_NAME}/${CI_COMMIT_REF_NAME}"
+    - DATE=$(date +%Y-%m-%d)
+    - find "$DOCS_OUTPUT_DIR" -type f | sort
+
+    - apt-get update && apt-get install -y curl jq
+
+    - export ACTIONS_FILE="$(mktemp)"
+    - echo '[]' > "$ACTIONS_FILE"
+
+    - |
+      echo "Fetching existing files in $DEST_DIR"
+
+      ENCODED_DEST_DIR=$(printf '%s' "$DEST_DIR" | sed 's/\//%2F/g')
+
+      OLD_FILES=$(curl --silent \
+        --header "PRIVATE-TOKEN: ${REPO_DOCS_TOKEN}" \
+        "https://gitlab.corpname.com/api/v4/projects/${REPO_DOCS_PROJECT_ID}/repository/tree?path=${ENCODED_DEST_DIR}&ref=${REPO_DOCS_BRANCH}&recursive=true&per_page=1000" \
+        2>/dev/null | jq -r '.[] | select(.type == "blob") | .path' 2>/dev/null || echo "")
+
+      if [ -z "$OLD_FILES" ]; then
+        echo "No previous files found (first upload)"
+      else
+        while IFS= read -r OLD_FILE_PATH; do
+          [ -z "$OLD_FILE_PATH" ] && continue
+          echo "Queuing delete for: $OLD_FILE_PATH"
+
+          TMP=$(mktemp)
+          jq --arg path "$OLD_FILE_PATH" \
+            '. + [{
+              action: "delete",
+              file_path: $path
+            }]' "$ACTIONS_FILE" > "$TMP" && mv "$TMP" "$ACTIONS_FILE"
+        done <<< "$OLD_FILES"
+      fi
+
+    - |
+      find "$DOCS_OUTPUT_DIR" -type f | while read -r f; do
+        REL_PATH="${f#${DOCS_OUTPUT_DIR}/}"
+        TARGET_PATH="${DEST_DIR}/${REL_PATH}"
+
+        echo "Queue create for $TARGET_PATH"
+
+        CONTENT_FILE=$(mktemp)
+        base64 -w 0 "$f" > "$CONTENT_FILE"
+
+        TMP=$(mktemp)
+        jq --arg path "$TARGET_PATH" --rawfile content "$CONTENT_FILE" \
+          '. + [{
+            action: "create",
+            file_path: $path,
+            content: $content,
+            encoding: "base64"
+          }]' "$ACTIONS_FILE" > "$TMP" && mv "$TMP" "$ACTIONS_FILE"
+
+        rm -f "$CONTENT_FILE"
+      done
+
+    - |
+      if [ "$(jq 'length' "$ACTIONS_FILE")" -eq 0 ]; then
+        echo "No new xml files to commit"
+        exit 0
+      fi
+
+    - |
+      echo "Actions to commit:"
+      jq -r '.[] | "\(.action)  \(.file_path)"' "$ACTIONS_FILE"
+
+    - |
+      jq -n \
+        --arg branch "$REPO_DOCS_BRANCH" \
+        --arg message "Automatic upload of Dotnet XML files [$DATE]" \
+        --slurpfile actions "$ACTIONS_FILE" \
+        '{
+          branch: $branch,
+          commit_message: $message,
+          actions: $actions[0]
+        }' > payload.json
+
+    - cat payload.json | jq '.commit_message, (.actions | length)'
+
+    - |
+      curl --silent --request POST \
+        --header "PRIVATE-TOKEN: ${REPO_DOCS_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data @payload.json \
+        "https://gitlab.corpname.com/api/v4/projects/${REPO_DOCS_PROJECT_ID}/repository/commits"
+
+  artifacts:
+    paths:
+      - docs/
+    expire_in: 1 days
+  
+  allow_failure: true
+  tags:
+    - DOCKER
+
+
+docs_angular:
+  stage: metrics
+  image: node:20-bullseye
+  dependencies:
+    - build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"      
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "dev"
+      exists:
+        - 'angular.json'
+        - 'package.json'
+    - if: $CI_COMMIT_REF_NAME == "master"
+      exists:
+          - 'angular.json'
+          - 'package.json'
+  before_script:
+    - |
+      if [ ! -f version.txt ]; then
+        echo "Artifacts from build were not generated. Exiting job"
+        exit 0
+      fi
+  script:
+    - export REPO_DOCS_USER="$REPO_DOCS_USER"
+    - export REPO_DOCS_TOKEN="$REPO_DOCS_TOKEN"
+    - export REPO_DOCS_PROJECT_ID="$REPO_DOCS_PROJECT_ID"
+    - export http_proxy=$HTTP_PROXY
+    - export https_proxy=$HTTPS_PROXY
+    - export no_proxy=$NO_PROX
+
+    - export ANGULAR_DOCS_OUTPUT_DIR="docs"
+    - mkdir -p "$ANGULAR_DOCS_OUTPUT_DIR"
+
+    - mkdir -p ~/.nuget/NuGet
+    - echo "$NUGET_CONFIG" > ~/.nuget/NuGet/NuGet.Config
+
+    - VERSION=$(cat version.txt)
+
+    - |
+      mkdir -p ~/.npm
+      echo "@devplatform:registry=https://${CI_SERVER_HOST}/api/v4/packages/npm/" > .npmrc
+      echo "registry=https://${CI_SERVER_HOST}/api/v4/packages/npm/" >> .npmrc
+      echo "//${CI_SERVER_HOST}/api/v4/packages/npm/:_authToken=${NPM_PACKAGE_REGISTRY_TOKEN}" >> .npmrc
+      cp .npmrc ~/.npmrc
+      
+    - npm install
+    - npm i -D @types/node@latest
+    - npm install --save-dev typedoc typedoc-plugin-markdown jsonc-parser
+
+    - |
+      if ! grep -q '"generate:tsdoc":' package.json; then
+        node -e '
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.scripts = pkg.scripts || {};
+          pkg.scripts["generate:tsdoc"] = "typedoc";
+          fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
+        '
+      else
+        echo "'generate:tsdoc' exists"
+      fi
+
+    - |
+      node <<'EOF'
+      const fs = require('fs');
+      const { parse } = require('jsonc-parser');
+
+      const file = 'tsconfig.json';
+
+      let config = {};
+
+      if (fs.existsSync(file)) {
+        const raw = fs.readFileSync(file, 'utf8');
+        config = parse(raw) || {};
+      }
+
+      config.compilerOptions = config.compilerOptions || {};
+      config.compilerOptions.target = config.compilerOptions.target || 'ES2022';
+
+      if (!fs.existsSync(file)) {
+        config.compilerOptions.module = config.compilerOptions.module || 'CommonJS';
+        config.compilerOptions.outDir = config.compilerOptions.outDir || './dist';
+        config.compilerOptions.rootDir = config.compilerOptions.rootDir || './src';
+      }
+
+      config.files = config.files || ['src/main.ts'];
+      config.include = config.include || ['src/**/*.ts'];
+
+      config.typedocOptions = config.typedocOptions || {};
+      config.typedocOptions.out = config.typedocOptions.out || 'docs';
+      config.typedocOptions.entryPoints = config.typedocOptions.entryPoints || ['src/main.ts'];
+
+      fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
+      console.log(`Updated ${file}`);
+      EOF
+
+    - npm run generate:tsdoc
+
+    - DATE=$(date +%Y-%m-%d)
+
+    - REPO_DOCS_BRANCH=master
+    - DEST_DIR="angular_docs/${CI_PROJECT_NAME}/${CI_COMMIT_REF_NAME}"
+
+    - find "$ANGULAR_DOCS_OUTPUT_DIR" -type f | sort
+    - apt-get update && apt-get install -y curl jq
+
+    - export ACTIONS_FILE="$(mktemp)"
+    - echo '[]' > "$ACTIONS_FILE"
+
+    - |
+      echo "Current VERSION: $VERSION"
+      
+      PROJECT_DOCS_PATH="angular_docs/${CI_PROJECT_NAME}/${CI_COMMIT_REF_NAME}"
+      ENCODED_PATH=$(printf '%s' "$PROJECT_DOCS_PATH" | sed 's/\//%2F/g')
+
+    - |
+      OLD_FILES=$(curl --silent \
+        --header "PRIVATE-TOKEN: ${REPO_DOCS_TOKEN}" \
+        "https://gitlab.corpname.com/api/v4/projects/${REPO_DOCS_PROJECT_ID}/repository/tree?path=${ENCODED_PATH}&ref=${REPO_DOCS_BRANCH}&recursive=true&per_page=1000" \
+        2>/dev/null | jq -r '.[] | select(.type == "blob") | .path' 2>/dev/null || echo "")
+
+      if [ -z "$OLD_FILES" ]; then
+        echo "No previous files found (first upload)"
+      else
+        while IFS= read -r OLD_FILE_PATH; do
+          [ -z "$OLD_FILE_PATH" ] && continue
+          echo "Queuing delete for: $OLD_FILE_PATH"
+
+          TMP=$(mktemp)
+          jq --arg path "$OLD_FILE_PATH" \
+            '. + [{
+              action: "delete",
+              file_path: $path
+            }]' "$ACTIONS_FILE" > "$TMP" && mv "$TMP" "$ACTIONS_FILE"
+        done <<< "$OLD_FILES"
+      fi
+
+    - |
+
+      find "$ANGULAR_DOCS_OUTPUT_DIR" -type f | while read -r f; do
+        REL_PATH="${f#${ANGULAR_DOCS_OUTPUT_DIR}/}"
+        TARGET_PATH="${DEST_DIR}/${REL_PATH}"
+        CONTENT=$(base64 -w 0 "$f")
+
+        echo "Queueing create: $TARGET_PATH"
+        TMP=$(mktemp)
+        jq --arg path "$TARGET_PATH" --arg content "$CONTENT" \
+          '. + [{
+            action: "create",
+            file_path: $path,
+            content: $content,
+            encoding: "base64"
+          }]' "$ACTIONS_FILE" > "$TMP" && mv "$TMP" "$ACTIONS_FILE"
+      done
+
+    - |
+      if [ "$(jq 'length' "$ACTIONS_FILE")" -eq 0 ]; then
+        echo "No changes to documentation"
+        exit 0
+      fi
+
+      TOTAL_ACTIONS=$(jq 'length' "$ACTIONS_FILE")
+      DELETES=$(jq '[.[] | select(.action=="delete")] | length' "$ACTIONS_FILE")
+      CREATES=$(jq '[.[] | select(.action=="create")] | length' "$ACTIONS_FILE")
+      
+      echo "Total actions: $TOTAL_ACTIONS (Deletes: $DELETES, Creates: $CREATES)"
+
+    - |
+      jq -n \
+        --arg branch "$REPO_DOCS_BRANCH" \
+        --arg message "Automatic upload of Angular TSDocs [$DATE]" \
+        --slurpfile actions "$ACTIONS_FILE" \
+        '{
+          branch: $branch,
+          commit_message: $message,
+          actions: $actions[0]
+        }' > payload.json
+
+    - |
+      curl --fail --request POST \
+        --header "PRIVATE-TOKEN: ${REPO_DOCS_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data @payload.json \
+        "https://gitlab.corpname.com/api/v4/projects/${REPO_DOCS_PROJECT_ID}/repository/commits"
+
+
+
+  artifacts:
+    paths:
+      - docs/
+    expire_in: 1 days
+    
+  allow_failure: true
+  tags:
+    - DOCKER
